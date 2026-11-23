@@ -12,7 +12,7 @@ The browser streams raw mic audio (48 kHz mono int16) to /ws. The server
    number of mic samples written at that moment (one clock for alignment).
 It reconnects through session resumption on GoAway or a dropped connection.
 
-Run: with-secrets uv run server.py --prompt PATH [--port 8730]
+Run: with-secrets uv run server.py --prompt PATH --topics PATH [--port 8730]
 """
 import argparse, asyncio, base64, json, os, time, wave
 from pathlib import Path
@@ -24,16 +24,18 @@ from scipy.signal import resample_poly
 
 HERE = Path(__file__).parent
 MIC_RATE = 48000
+# Voices with a preview clip in static/voices/ (Gemini Live prebuilt voices, all checked on gemini-3.8-live 2026-11-23).
+VOICES = sorted(p.stem for p in (HERE / "static" / "voices").glob("*.ogg"))
 LIVE_URL = ("wss://generativelanguage.googleapis.com/ws/"
             "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=")
 
 
-def setup_msg(args, prompt, handle=None):
+def setup_msg(args, prompt, voice, handle=None):
     s = {
         "model": f"models/{args.model}",
         "generationConfig": {
             "responseModalities": ["AUDIO"],
-            "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": args.voice}}},
+            "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}},
         },
         "systemInstruction": {"parts": [{"text": prompt}]},
         "inputAudioTranscription": {},
@@ -50,8 +52,12 @@ def setup_msg(args, prompt, handle=None):
 
 
 class Session:
-    def __init__(self, args, prompt, browser):
-        self.args, self.prompt, self.browser = args, prompt, browser
+    def __init__(self, args, prompt, browser, topic="", voice=None):
+        self.args, self.browser = args, browser
+        self.topic, self.voice = topic, voice or args.voice
+        if topic:
+            prompt += f"\n\nOpening topic for this call: {topic}. Start there; move to other topics when it runs dry."
+        self.prompt = prompt
         stamp = time.strftime("%Y%m%dT%H%M%S")
         self.dir = Path(args.out).expanduser() / stamp
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -66,7 +72,7 @@ class Session:
         self.live = None
         self.closed = False
         (self.dir / "meta.json").write_text(json.dumps({
-            "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "model": args.model, "voice": args.voice,
+            "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "topic": topic, "model": args.model, "voice": self.voice,
             "mic_rate": MIC_RATE, "silence_ms": args.silence_ms, "prompt_file": str(args.prompt),
             "prompt": prompt}, indent=2))
 
@@ -77,7 +83,7 @@ class Session:
 
     async def connect(self):
         self.live = await websockets.connect(LIVE_URL + os.environ["GEMINI_API_KEY"], max_size=None)
-        await self.live.send(json.dumps(setup_msg(self.args, self.prompt, self.handle)))
+        await self.live.send(json.dumps(setup_msg(self.args, self.prompt, self.voice, self.handle)))
         reply = json.loads(await self.live.recv())
         self.log("live_connected", resumed=bool(self.handle), reply=list(reply))
 
@@ -169,7 +175,9 @@ async def ws_handler(request):
     args, prompt = request.app["args"], request.app["prompt"]
     browser = web.WebSocketResponse(max_msg_size=0)
     await browser.prepare(request)
-    s = Session(args, prompt, browser)
+    first = await browser.receive_json()  # {"type": "start", "topic": ..., "voice": ...}
+    voice = first.get("voice") if first.get("voice") in VOICES else None
+    s = Session(args, prompt, browser, topic=str(first.get("topic", ""))[:200], voice=voice)
     try:
         await s.connect()
     except Exception as e:  # noqa: BLE001
@@ -196,15 +204,18 @@ async def ws_handler(request):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt", default=str(HERE / "prompts" / "interviewer.md"))
+    ap.add_argument("--topics", default=str(HERE / "prompts" / "topics.json"))
     ap.add_argument("--model", default="gemini-3.8-live")
-    ap.add_argument("--voice", default="Puck")
+    ap.add_argument("--voice", default="Sulafat")
     ap.add_argument("--silence-ms", type=int, default=1200)
     ap.add_argument("--out", default="~/.local/share/agent-interview-recorder/sessions")
     ap.add_argument("--port", type=int, default=8730)
     args = ap.parse_args()
     app = web.Application()
     app["args"], app["prompt"] = args, Path(args.prompt).expanduser().read_text()
+    app["topics"] = json.loads(Path(args.topics).expanduser().read_text())
     app.router.add_get("/ws", ws_handler)
+    app.router.add_get("/config", lambda r: web.json_response({"topics": r.app["topics"], "voices": VOICES, "voice": args.voice}))
     app.router.add_get("/", lambda r: web.FileResponse(HERE / "static" / "index.html"))
     app.router.add_static("/static", HERE / "static")
     print(f"open http://localhost:{args.port}  (prompt: {args.prompt})")
