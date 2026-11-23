@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Interview</title>
+<style>
+  body { margin:0; height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center;
+         background:#101418; color:#e8eef2; font-family:system-ui, sans-serif; gap:18px; }
+  #who { font-size:22px; opacity:.85 }
+  #timer { font-size:48px; font-variant-numeric:tabular-nums; }
+  #state { font-size:15px; opacity:.7; min-height:1.2em }
+  #ring { width:120px; height:120px; border-radius:50%; background:#1d2730; transition:box-shadow .15s; }
+  #ring.agent { box-shadow:0 0 0 10px #2d6cdf55; }
+  #ring.me { box-shadow:0 0 0 10px #2fbf7155; }
+  button { width:84px; height:84px; border-radius:50%; border:0; font-size:15px; color:#fff; cursor:pointer; }
+  #call { background:#2fbf71 } #hang { background:#e0453a; display:none }
+  #cap { max-width:640px; min-height:3em; text-align:center; opacity:.55; font-size:15px; padding:0 16px }
+  #note { font-size:13px; opacity:.45 }
+</style>
+</head>
+<body>
+  <div id="who">Interviewer</div>
+  <div id="ring"></div>
+  <div id="timer">00:00</div>
+  <div id="state">Headphones on, then call.</div>
+  <button id="call">Call</button>
+  <button id="hang">End</button>
+  <div id="cap"></div>
+  <div id="note"></div>
+<script>
+const $ = id => document.getElementById(id);
+let ws, micCtx, playCtx, micStream, node, t0, tick;
+let nextAt = 0, sources = [], playing = false, captionTimer;
+
+const workletSrc = `
+class Cap extends AudioWorkletProcessor {
+  constructor(){ super(); this.buf = new Int16Array(4800); this.n = 0; }
+  process(inputs){
+    const ch = inputs[0][0]; if (!ch) return true;
+    let peak = 0;
+    for (let i = 0; i < ch.length; i++) {
+      const v = Math.max(-1, Math.min(1, ch[i])); peak = Math.max(peak, Math.abs(v));
+      this.buf[this.n++] = v < 0 ? v * 0x8000 : v * 0x7fff;
+      if (this.n === this.buf.length) { this.port.postMessage({pcm: this.buf.buffer, peak}, [this.buf.buffer]); this.buf = new Int16Array(4800); this.n = 0; }
+    }
+    return true;
+  }
+}
+registerProcessor('cap', Cap);`;
+
+function send(o){ if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+function setState(s){ $('state').textContent = s; }
+function caption(who, text){
+  const c = $('cap'); if (c.dataset.who !== who) { c.textContent = ''; c.dataset.who = who; }
+  c.textContent = (c.textContent + text).slice(-300);
+}
+
+function playPcm(buf){
+  const i16 = new Int16Array(buf), f = new Float32Array(i16.length);
+  for (let i = 0; i < i16.length; i++) f[i] = i16[i] / 32768;
+  const ab = playCtx.createBuffer(1, f.length, 24000); ab.copyToChannel(f, 0);
+  const src = playCtx.createBufferSource(); src.buffer = ab; src.connect(playCtx.destination);
+  const now = playCtx.currentTime; if (nextAt < now + 0.03) nextAt = now + 0.03;
+  src.start(nextAt); nextAt += ab.duration; sources.push(src);
+  if (!playing) { playing = true; send({type:'playback_start'}); $('ring').className = 'agent'; }
+  src.onended = () => {
+    sources = sources.filter(s => s !== src);
+    if (!sources.length && playing) { playing = false; send({type:'playback_end'}); $('ring').className = ''; }
+  };
+}
+function stopPlayback(){
+  for (const s of sources) { s.onended = null; try { s.stop(); } catch(e){} }
+  sources = []; nextAt = 0;
+  if (playing) { playing = false; send({type:'playback_end', interrupted:true}); $('ring').className = ''; }
+}
+
+async function call(){
+  $('call').style.display = 'none'; setState('Connecting…');
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: {
+    channelCount: 1, sampleRate: 48000, echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+  micCtx = new AudioContext({ sampleRate: 48000 });
+  playCtx = new AudioContext({ sampleRate: 24000 });
+  await micCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([workletSrc], {type:'text/javascript'})));
+  node = new AudioWorkletNode(micCtx, 'cap');
+  micCtx.createMediaStreamSource(micStream).connect(node);
+  ws = new WebSocket(`ws://${location.host}/ws`); ws.binaryType = 'arraybuffer';
+  ws.onopen = () => {
+    node.port.onmessage = e => {
+      if (ws.readyState === 1) ws.send(e.data.pcm);
+      if (!playing) $('ring').className = e.data.peak > 0.05 ? 'me' : '';
+    };
+    t0 = Date.now(); tick = setInterval(() => {
+      const s = Math.floor((Date.now() - t0) / 1000);
+      $('timer').textContent = `${String(Math.floor(s/60)).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`;
+    }, 500);
+    $('hang').style.display = 'block'; setState('Connected');
+  };
+  ws.onmessage = e => {
+    if (typeof e.data !== 'string') return playPcm(e.data);
+    const m = JSON.parse(e.data);
+    if (m.type === 'interrupted') stopPlayback();
+    else if (m.type === 'agent_text') caption('agent', m.text);
+    else if (m.type === 'user_text') caption('me', m.text);
+    else if (m.type === 'status') setState(m.text);
+    else if (m.type === 'session') $('note').textContent = 'Saving to ' + m.dir;
+  };
+  ws.onclose = () => hangup(true);
+}
+
+function hangup(remote){
+  if (!ws) return;
+  if (!remote) send({type:'hangup'});
+  stopPlayback(); clearInterval(tick);
+  setTimeout(() => { try { ws.close(); } catch(e){} ws = null; }, 300);
+  micStream?.getTracks().forEach(t => t.stop()); micCtx?.close(); playCtx?.close();
+  $('hang').style.display = 'none'; $('call').style.display = 'block';
+  setState('Call ended. Audio saved.');
+}
+$('call').onclick = () => call().catch(e => { setState('Error: ' + e.message); $('call').style.display = 'block'; });
+$('hang').onclick = () => hangup(false);
+</script>
+</body>
+</html>
